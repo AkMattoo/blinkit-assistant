@@ -1,0 +1,16 @@
+# SendWhatsApp subflow (WhatsApp Web). Reusable: sends whatever is in ShortText.
+# Reads: Secrets, ShortText. Requires WhatsApp Web already logged in (scan QR once in this Chrome profile).
+
+SET ErrorStep TO $'''WhatsApp'''
+WebAutomation.LaunchChrome.LaunchChrome Url: $'''https://web.whatsapp.com''' WindowState: WebAutomation.BrowserWindowState.Maximized ClearCache: False ClearCookies: False WaitForPageToLoadTimeout: 60 Timeout: 60 BrowserInstance=> WA
+WAIT (WebAutomation.WaitForWebPageContent.WebPageToContainElement BrowserInstance: WA Control: appmask['WhatsApp']['Search box']) FOR 60   # <<capture>>
+WebAutomation.PopulateTextField.PopulateTextField BrowserInstance: WA Control: appmask['WhatsApp']['Search box'] Text: Secrets[0]['whatsapp_contact']
+WAIT 2
+WebAutomation.Click.Click BrowserInstance: WA Control: appmask['WhatsApp']['First chat result']   # <<capture>>
+WebAutomation.PopulateTextField.PopulateTextField BrowserInstance: WA Control: appmask['WhatsApp']['Message box'] Text: ShortText   # <<capture>>
+MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Enter}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+WAIT 3
+ON ERROR
+    SET ErrorMessage TO $'''WhatsApp Web send failed (not logged in or element moved)'''
+    CALL HandleError
+END

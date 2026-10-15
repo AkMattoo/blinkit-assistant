@@ -1,0 +1,9 @@
+# SendEmail subflow (SMTP). Reusable: sends whatever is in SummaryText.
+# Reads: Secrets, SummaryText.  On failure: summary file already saved → log, skip WhatsApp, stop.
+
+SET ErrorStep TO $'''Email'''
+Email.SendEmail.SendEmail SmtpServer: $'''smtp.gmail.com''' Port: 587 EnableSSL: True SmtpUsername: Secrets[0]['gmail_user'] SmtpPassword: Secrets[0]['gmail_app_password'] AcceptUntrustedCertificates: False From: Secrets[0]['gmail_user'] SendTo: Secrets[0]['email_to'] Subject: $'''Blinkit cart summary (%RunStatus%) — no order placed''' Body: SummaryText IsBodyHtml: False IsTLSNeeded: True
+ON ERROR
+    SET ErrorMessage TO $'''Gmail SMTP failed. Summary saved in output folder; WhatsApp skipped.'''
+    CALL HandleError
+END

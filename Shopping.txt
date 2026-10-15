@@ -1,0 +1,213 @@
+# Shopping subflow.
+# Reads: Items, Address, Budget.  Sets: CartRows, CartTotal, RunStatus, SummaryText, ShortText.
+# UI elements marked <<capture>> must be recorded in PAD's UI element picker on your machine.
+# HARD RULE: never click "Proceed" / "Pay". Flow ends on the cart page with a screenshot.
+
+SET ErrorStep TO $'''Shopping: open site'''
+WebAutomation.LaunchChrome.LaunchChrome Url: $'''https://blinkit.com''' WindowState: WebAutomation.BrowserWindowState.Maximized ClearCache: False ClearCookies: False WaitForPageToLoadTimeout: 60 Timeout: 60 BrowserInstance=> Browser
+
+# --- Address: set, read back, verify, retry once ---
+SET ErrorStep TO $'''Shopping: address'''
+LOOP AddrTry FROM 1 TO 2 STEP 1
+    WebAutomation.Click.Click BrowserInstance: Browser Control: appmask['Blinkit']['Location button']        # <<capture>>
+    WebAutomation.PopulateTextField.PopulateTextField BrowserInstance: Browser Control: appmask['Blinkit']['Location search'] Text: Address  # <<capture>>
+    WebAutomation.Click.Click BrowserInstance: Browser Control: appmask['Blinkit']['First location suggestion']  # <<capture>>
+    WAIT 3
+    WebAutomation.GetDetailsOfElement BrowserInstance: Browser Control: appmask['Blinkit']['Header address text'] AttributeName: $'''Own Text''' AttributeValue=> ShownAddress  # <<capture>>
+    # Verify on pincode (last 6 digits of config address) – robust to formatting differences
+    Text.ParseText.RegexParse Text: Address TextToFind: $'''\\d{6}''' StartingPosition: 0 IgnoreCase: False Match=> Pin
+    IF Contains(ShownAddress, Pin, True) THEN
+        EXIT LOOP
+    END
+    IF AddrTry = 2 THEN
+        SET ErrorMessage TO $'''Address mismatch after retry. Shown: %ShownAddress%'''
+        CALL HandleError
+    END
+END
+
+# --- Per item: search, parse sizes, pick lowest price per unit ---
+Variables.CreateNewDatatable InputTable: { ^['item', 'brand_size', 'qty', 'price', 'per_unit', 'result_count', 'status', 'alternatives', 'unit_price', 'cheap_name', 'cheap_price'] } DataTable=> CartRows
+LOOP FOREACH Row IN Items
+    SET ErrorStep TO $'''Shopping: search %Row['item']%'''
+    SET Refreshes TO 0
+    WebAutomation.GoToWebPage.GoToWebPage BrowserInstance: Browser Url: $'''https://blinkit.com/s/?q=%Row['item']%''' WaitForPageToLoadTimeout: 60
+    # Slow load: refresh up to 3 times, then stop
+    LOOP WHILE (WebAutomation.IfWebPageContains.ElementNotExists BrowserInstance: Browser Control: appmask['Blinkit']['Product card']) AND (Refreshes < 3)  # <<capture>>
+        WebAutomation.GoToWebPage.GoToWebPageReload BrowserInstance: Browser WaitForPageToLoadTimeout: 60
+        Variables.IncreaseVariable Value: Refreshes IncrementValue: 1
+    END
+    IF Refreshes = 3 THEN
+        SET ErrorMessage TO $'''Search page did not load after 3 refreshes'''
+        CALL HandleError
+    END
+
+    # Scrape all cards: name, size, price, stock (one row per card)
+    WebAutomation.ExtractData.ExtractListUsingPagingFromNumberedPageLinks BrowserInstance: Browser ExtractionParameters: {[$'''<<capture card container>>''', $'''Own Text''', $'''''', $'''Name'''], [$'''<<capture size>>''', $'''Own Text''', $'''''', $'''Size'''], [$'''<<capture price>>''', $'''Own Text''', $'''''', $'''Price'''], [$'''<<capture ADD/Out of stock button>>''', $'''Own Text''', $'''''', $'''Button''']} MaxWebPagesToProcess: 1 ExtractedData=> Results
+    SET ResultCount TO Results.RowsCount
+
+    SET Best TO -1
+    SET BestPerUnit TO 999999
+    SET Alternatives TO $''''''
+    SET CheapPrice TO 999999
+    LOOP FOREACH Card IN Results
+        # Parse size: "500 ml", "1 L", "400 g", "6 pcs"
+        Text.ParseText.RegexParseForFirstOccurrence Text: Card['Size'] TextToFind: $'''(\\d+(?:\\.\\d+)?)\\s*(ml|l|g|kg|pc|pcs)''' StartingPosition: 0 IgnoreCase: True OccurrencePosition=> Pos Match=> SizeText
+        IF Pos = -1 THEN
+            NEXT LOOP          # unparseable → skip (your rule)
+        END
+        Text.ParseText.RegexParseForFirstOccurrence Text: SizeText TextToFind: $'''\\d+(?:\\.\\d+)?''' StartingPosition: 0 IgnoreCase: False Match=> NumText
+        Text.ToNumber Text: NumText Number=> Amount
+        Text.ToLower Text: SizeText TextResult=> SizeLower
+        IF EndsWith(SizeLower, $'''ml''', True) OR EndsWith(SizeLower, $'''g''', True) THEN
+            IF NOT EndsWith(SizeLower, $'''kg''', True) THEN
+                SET Amount TO Amount / 1000
+            END
+        END
+        Text.Replace Text: Card['Price'] TextToFind: $'''₹''' IsRegEx: False IgnoreCase: False ReplaceWith: $'''''' ActivateEscapeSequences: False Result=> PriceText
+        Text.ToNumber Text: PriceText Number=> Price
+        SET PerUnit TO Price / Amount
+        IF Contains(Card['Button'], $'''Out of stock''', True) THEN
+            SET Alternatives TO $'''%Alternatives%%Card['Name']% %Card['Size']% ₹%Price% (out of stock); '''
+            NEXT LOOP
+        END
+        SET Alternatives TO $'''%Alternatives%%Card['Name']% %Card['Size']% ₹%Price%; '''
+        # Track cheapest in-stock option by absolute price (used by the over-budget swap)
+        IF Price < CheapPrice THEN
+            SET CheapPrice TO Price
+            SET CheapName TO $'''%Card['Name']% %Card['Size']%'''
+        END
+        IF PerUnit < BestPerUnit THEN
+            SET BestPerUnit TO PerUnit
+            SET BestName TO $'''%Card['Name']% %Card['Size']%'''
+            SET BestPrice TO Price
+        END
+    END
+
+    IF BestPerUnit = 999999 THEN
+        Variables.AddRowToDataTable.AppendItemToDataTable DataTable: CartRows RowToAdd: [Row['item'], $'''-''', Row['quantity'], 0, 0, ResultCount, $'''not found / out of stock''', Alternatives, 0, $'''-''', 0]
+        SET RunStatus TO $'''PARTIAL'''
+        NEXT LOOP
+    END
+
+    # Add to cart: retry once, then mark "could not add"
+    SET ErrorStep TO $'''Shopping: add %Row['item']%'''
+    SET Added TO False
+    LOOP Try FROM 1 TO 2 STEP 1
+        WebAutomation.Click.Click BrowserInstance: Browser Control: appmask['Blinkit']['ADD button for best card']  # <<capture, make selector use BestName>>
+        ON ERROR
+            NEXT LOOP
+        END
+        # Quantity > 1: press "+" (quantity - 1) times
+        LOOP Plus FROM 2 TO Row['quantity'] STEP 1
+            WebAutomation.Click.Click BrowserInstance: Browser Control: appmask['Blinkit']['Plus button']  # <<capture>>
+        END
+        SET Added TO True
+        EXIT LOOP
+    END
+    IF Added THEN
+        Variables.AddRowToDataTable.AppendItemToDataTable DataTable: CartRows RowToAdd: [Row['item'], BestName, Row['quantity'], BestPrice * Row['quantity'], BestPerUnit, ResultCount, $'''added''', Alternatives, BestPrice, CheapName, CheapPrice]
+    ELSE
+        Variables.AddRowToDataTable.AppendItemToDataTable DataTable: CartRows RowToAdd: [Row['item'], BestName, Row['quantity'], 0, BestPerUnit, ResultCount, $'''could not add''', Alternatives, BestPrice, CheapName, CheapPrice]
+        SET RunStatus TO $'''PARTIAL'''
+    END
+END
+
+# --- Budget check ---
+SET CartTotal TO 0
+LOOP FOREACH C IN CartRows
+    SET CartTotal TO CartTotal + C['price']
+END
+# Swap rule (yours): most expensive item first → its cheapest in-stock option.
+# Stop when under budget OR no item left with a cheaper option.
+SET SwapLog TO $''''''
+LOOP WHILE CartTotal > Budget
+    SET ErrorStep TO $'''Shopping: budget swap'''
+    # Find most expensive item that is in the cart, not yet swapped, and has a cheaper option
+    SET Pick TO -1
+    SET PickPrice TO -1
+    LOOP i FROM 0 TO CartRows.RowsCount - 1 STEP 1
+        IF CartRows[i]['status'] = $'''added''' AND CartRows[i]['cheap_price'] < CartRows[i]['unit_price'] AND CartRows[i]['price'] > PickPrice THEN
+            SET Pick TO i
+            SET PickPrice TO CartRows[i]['price']
+        END
+    END
+    IF Pick = -1 THEN
+        EXIT LOOP          # nothing cheaper left → stop, flag over budget below
+    END
+
+    SET Qty TO CartRows[Pick]['qty']
+    # 1) Remove old product: open cart, press "−" until it disappears
+    WebAutomation.Click.Click BrowserInstance: Browser Control: appmask['Blinkit']['Cart button']  # <<capture>>
+    LOOP m FROM 1 TO Qty STEP 1
+        WebAutomation.Click.Click BrowserInstance: Browser Control: appmask['Blinkit']['Minus button for cart row']  # <<capture, selector uses CartRows[Pick]['brand_size']>>
+    END
+    ON ERROR
+        Variables.ModifyDataTableItem DataTable: CartRows ColumnNameOrIndex: $'''status''' RowIndex: Pick Value: $'''swap failed'''
+        SET RunStatus TO $'''PARTIAL'''
+        NEXT LOOP
+    END
+    # 2) Add cheapest option with same quantity
+    WebAutomation.GoToWebPage.GoToWebPage BrowserInstance: Browser Url: $'''https://blinkit.com/s/?q=%CartRows[Pick]['item']%''' WaitForPageToLoadTimeout: 60
+    WebAutomation.Click.Click BrowserInstance: Browser Control: appmask['Blinkit']['ADD button for cheapest card']  # <<capture, selector uses cheap_name>>
+    LOOP Plus FROM 2 TO Qty STEP 1
+        WebAutomation.Click.Click BrowserInstance: Browser Control: appmask['Blinkit']['Plus button']  # <<capture>>
+    END
+    ON ERROR
+        # Old one already removed → mark so the summary is honest
+        Variables.ModifyDataTableItem DataTable: CartRows ColumnNameOrIndex: $'''status''' RowIndex: Pick Value: $'''swap failed (removed, re-add manually)'''
+        Variables.ModifyDataTableItem DataTable: CartRows ColumnNameOrIndex: $'''price''' RowIndex: Pick Value: 0
+        SET RunStatus TO $'''PARTIAL'''
+        GOTO Recalc
+    END
+
+    SET SwapLog TO $'''%SwapLog%%CartRows[Pick]['item']%: %CartRows[Pick]['brand_size']% → %CartRows[Pick]['cheap_name']%; '''
+    Variables.ModifyDataTableItem DataTable: CartRows ColumnNameOrIndex: $'''brand_size''' RowIndex: Pick Value: CartRows[Pick]['cheap_name']
+    Variables.ModifyDataTableItem DataTable: CartRows ColumnNameOrIndex: $'''unit_price''' RowIndex: Pick Value: CartRows[Pick]['cheap_price']
+    Variables.ModifyDataTableItem DataTable: CartRows ColumnNameOrIndex: $'''price''' RowIndex: Pick Value: CartRows[Pick]['cheap_price'] * Qty
+    Variables.ModifyDataTableItem DataTable: CartRows ColumnNameOrIndex: $'''status''' RowIndex: Pick Value: $'''added (swapped for budget)'''
+
+    LABEL Recalc
+    SET CartTotal TO 0
+    LOOP FOREACH C IN CartRows
+        SET CartTotal TO CartTotal + C['price']
+    END
+END
+IF CartTotal > Budget THEN
+    SET RunStatus TO $'''PARTIAL'''
+END
+
+# --- Stop at cart, screenshot, build summaries ---
+WebAutomation.Click.Click BrowserInstance: Browser Control: appmask['Blinkit']['Cart button']  # <<capture>>  (NEVER Proceed/Pay)
+WAIT 3
+DateTime.GetCurrentDateTime.Local DateTimeFormat: DateTime.DateTimeFormat.DateAndTime CurrentDateTime=> Now
+Text.FromCustomDateTime DateTime: Now CustomFormat: $'''yyyyMMdd_HHmm''' Result=> Stamp
+Workstation.TakeScreenshot.TakeScreenshotAndSaveToFile File: $'''%ProjectDir%\\output\\cart_%Stamp%.png''' ImageFormat: System.ImageFormat.Png
+
+File.WriteToCSVFile.WriteCSV VariableToWrite: CartRows CSVFile: $'''%ProjectDir%\\output\\summary_%Stamp%.csv''' CsvFileEncoding: File.CSVEncoding.UTF8 IncludeColumnNames: True IfFileExists: File.IfFileExists.Overwrite ColumnsSeparator: File.CSVColumnsSeparator.Comma
+
+SET SummaryText TO $'''Blinkit cart summary — %Stamp%
+Status: %RunStatus%
+Delivery address: %Address%
+Budget: ₹%Budget%   Cart total: ₹%CartTotal%
+NO ORDER WAS PLACED. The bot stops before checkout/payment by design.
+
+'''
+LOOP FOREACH C IN CartRows
+    SET SummaryText TO $'''%SummaryText%- %C['item']%: %C['brand_size']% x%C['qty']% = ₹%C['price']% [%C['status']%]
+   Other options: %C['alternatives']%
+'''
+END
+IF CartTotal > Budget THEN
+    SET SummaryText TO $'''%SummaryText%
+WARNING: over budget by ₹%CartTotal - Budget% — no cheaper in-stock options left.'''
+END
+IF SwapLog <> $'''''' THEN
+    SET SummaryText TO $'''%SummaryText%
+Budget swaps made: %SwapLog%'''
+END
+File.WriteText File: $'''%ProjectDir%\\output\\summary_%Stamp%.txt''' TextToWrite: SummaryText AppendNewLine: False IfFileExists: File.IfFileExists.Overwrite Encoding: File.FileEncoding.UTF8
+
+SET ShortText TO $'''🛒 Blinkit cart ready: %Items.RowsCount% items, ₹%CartTotal% of ₹%Budget% budget. Status: %RunStatus%. No order placed. Full summary emailed.'''
+IF RunStatus = $'''PARTIAL''' THEN
+    SET ShortText TO $'''%ShortText% Some items need attention — check email.'''
+END

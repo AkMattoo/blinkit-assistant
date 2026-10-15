@@ -1,0 +1,37 @@
+# Main subflow — paste into PAD's Main tab.
+# Shared variables (PAD subflows have no parameters):
+#   ProjectDir, Items, Settings, Secrets, Budget, Address
+#   CartRows (datatable), CartTotal, RunStatus, SummaryText, ShortText
+#   ErrorStep, ErrorMessage
+
+SET ProjectDir TO $'''C:\\blinkit-assistant'''
+SET RunStatus TO $'''OK'''
+SET ErrorStep TO $'''Config'''
+
+# --- Load + validate config (stop fast on bad input) ---
+File.ReadCSV.ReadCSV CSVFile: $'''%ProjectDir%\\config\\items.csv''' Encoding: File.CSVEncoding.UTF8 TrimFields: True FirstLineContainsColumnNames: True ColumnsSeparator: File.CSVColumnsSeparator.SystemDefault CSVTable=> Items
+File.ReadCSV.ReadCSV CSVFile: $'''%ProjectDir%\\config\\settings.csv''' Encoding: File.CSVEncoding.UTF8 TrimFields: True FirstLineContainsColumnNames: True ColumnsSeparator: File.CSVColumnsSeparator.SystemDefault CSVTable=> Settings
+File.ReadCSV.ReadCSV CSVFile: $'''%ProjectDir%\\config\\secrets.csv''' Encoding: File.CSVEncoding.UTF8 TrimFields: True FirstLineContainsColumnNames: True ColumnsSeparator: File.CSVColumnsSeparator.SystemDefault CSVTable=> Secrets
+ON ERROR
+    SET ErrorMessage TO $'''Config file missing or unreadable'''
+    CALL HandleError
+END
+
+SET Address TO Settings[0]['address']
+Text.ToNumber Text: Settings[0]['budget'] Number=> Budget
+ON ERROR
+    SET ErrorMessage TO $'''Budget is not a number'''
+    CALL HandleError
+END
+LOOP FOREACH Row IN Items
+    Text.ToNumber Text: Row['quantity'] Number=> Qty
+    ON ERROR
+        SET ErrorMessage TO $'''Quantity is not a number for %Row['item']%'''
+        CALL HandleError
+    END
+END
+
+# --- Run the pieces ---
+CALL Shopping          # builds cart, CartTotal, SummaryText, ShortText; never pays
+CALL SendEmail         # on failure: saves summary, skips WhatsApp, stops (handled inside)
+CALL SendWhatsApp

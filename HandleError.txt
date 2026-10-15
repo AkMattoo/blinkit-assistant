@@ -1,0 +1,9 @@
+# HandleError subflow. Callers set ErrorStep + ErrorMessage, then CALL HandleError.
+# Leaves: output\error_log.txt line + output\error_<time>.png, then stops the flow.
+
+SET RunStatus TO $'''FAILED'''
+DateTime.GetCurrentDateTime.Local DateTimeFormat: DateTime.DateTimeFormat.DateAndTime CurrentDateTime=> ErrNow
+Text.FromCustomDateTime DateTime: ErrNow CustomFormat: $'''yyyyMMdd_HHmmss''' Result=> ErrStamp
+File.WriteText File: $'''%ProjectDir%\\output\\error_log.txt''' TextToWrite: $'''%ErrStamp% | %ErrorStep% | %ErrorMessage%''' AppendNewLine: True IfFileExists: File.IfFileExists.Append Encoding: File.FileEncoding.UTF8
+Workstation.TakeScreenshot.TakeScreenshotAndSaveToFile File: $'''%ProjectDir%\\output\\error_%ErrStamp%.png''' ImageFormat: System.ImageFormat.Png
+STOP FLOW
