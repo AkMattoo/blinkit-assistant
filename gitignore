@@ -1,0 +1,4 @@
+config/secrets.csv
+output/*
+!output/.keep
+*.zip
